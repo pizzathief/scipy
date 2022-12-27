@@ -12,7 +12,7 @@ import numpy as np
 from numpy import finfo, power, nan, isclose
 
 
-from scipy.optimize import zeros, newton, root_scalar
+from scipy.optimize import _zeros_py as zeros, newton, root_scalar
 
 from scipy._lib._util import getfullargspec_no_self as _getfullargspec
 
@@ -60,7 +60,7 @@ def f_lrucached(x):
     return x
 
 
-class TestBasic(object):
+class TestBasic:
 
     def run_check_by_name(self, name, smoothness=0, **kwargs):
         a = .5
@@ -423,7 +423,7 @@ class TestBasic(object):
             assert_equal(x, r.root)
             assert_equal((r.iterations, r.function_calls), expected_counts[derivs])
             if derivs == 0:
-                assert(r.function_calls <= r.iterations + 1)
+                assert r.function_calls <= r.iterations + 1
             else:
                 assert_equal(r.function_calls, (derivs + 1) * r.iterations)
 
@@ -500,6 +500,21 @@ def test_gh_5557():
     for method in methods:
         res = method(f, 0, 1, xtol=atol, rtol=rtol)
         assert_allclose(0.6, res, atol=atol, rtol=rtol)
+
+
+def test_brent_underflow_in_root_bracketing():
+    # Tetsing if an interval [a,b] brackets a zero of a function
+    # by checking f(a)*f(b) < 0 is not reliable when the product
+    # underflows/overflows. (reported in issue# 13737)
+
+    underflow_scenario = (-450.0, -350.0, -400.0)
+    overflow_scenario = (350.0, 450.0, 400.0)
+
+    for a, b, root in [underflow_scenario, overflow_scenario]:
+        c = np.exp(root)
+        for method in [zeros.brenth, zeros.brentq]:
+            res = method(lambda x: np.exp(x)-c, a, b)
+            assert_allclose(root, res)
 
 
 class TestRootResults:
@@ -675,11 +690,11 @@ def test_gh_8881():
     # The function has positive slope, x0 < root.
     # Newton succeeds in 8 iterations
     rt, r = newton(f, x0, fprime=fp, full_output=True)
-    assert(r.converged)
+    assert r.converged
     # Before the Issue 8881/PR 8882, halley would send x in the wrong direction.
     # Check that it now succeeds.
     rt, r = newton(f, x0, fprime=fp, fprime2=fpp, full_output=True)
-    assert(r.converged)
+    assert r.converged
 
 
 def test_gh_9608_preserve_array_shape():
@@ -698,7 +713,7 @@ def test_gh_9608_preserve_array_shape():
 
     x0 = np.array([-2], dtype=np.float32)
     rt, r = newton(f, x0, fprime=fp, fprime2=fpp, full_output=True)
-    assert(r.converged)
+    assert r.converged
 
     x0_array = np.array([-2, -3], dtype=np.float32)
     # This next invocation should fail
@@ -753,3 +768,42 @@ def test_gh9551_raise_error_if_disp_true():
         zeros.newton(f, 1.0, f_p)
     root = zeros.newton(f, complex(10.0, 10.0), f_p)
     assert_allclose(root, complex(0.0, 1.0))
+
+
+@pytest.mark.parametrize('solver_name',
+                         ['brentq', 'brenth', 'bisect', 'ridder', 'toms748'])
+@pytest.mark.parametrize('rs_interface', [True, False])
+def test_gh3089_8394(solver_name, rs_interface):
+    # gh-3089 and gh-8394 reported that bracketing solvers returned incorrect
+    # results when they encountered NaNs. Check that this is resolved.
+    solver = ((lambda f, a, b: root_scalar(f, bracket=(a, b))) if rs_interface
+              else getattr(zeros, solver_name))
+
+    def f(x):
+        return np.nan
+
+    message = "The function value at x..."
+    with pytest.raises(ValueError, match=message):
+        solver(f, 0, 1)
+
+
+@pytest.mark.parametrize('solver_name',
+                         ['brentq', 'brenth', 'bisect', 'ridder', 'toms748'])
+@pytest.mark.parametrize('rs_interface', [True, False])
+def test_function_calls(solver_name, rs_interface):
+    # There do not appear to be checks that the bracketing solvers report the
+    # correct number of function evaluations. Check that this is the case.
+    solver = ((lambda f, a, b, **kwargs: root_scalar(f, bracket=(a, b)))
+              if rs_interface else getattr(zeros, solver_name))
+
+    def f(x):
+        f.calls += 1
+        return x**2 - 1
+    f.calls = 0
+
+    res = solver(f, 0, 10, full_output=True)
+
+    if rs_interface:
+        assert res.function_calls == f.calls
+    else:
+        assert res[1].function_calls == f.calls
