@@ -300,7 +300,10 @@ class TestInterp1D:
         # regression test for gh-5898, where 1D linear interpolation has been
         # delegated to numpy.interp for all float dtypes, and the latter was
         # not handling e.g. np.float128.
-        for dtyp in np.sctypes["float"]:
+        for dtyp in [np.float16,
+                     np.float32,
+                     np.float64,
+                     np.longdouble]:
             x = np.arange(8, dtype=dtyp)
             y = x
             yp = interp1d(x, y, kind='linear')(x)
@@ -329,7 +332,7 @@ class TestInterp1D:
                     for kind in spline_kinds:
                         f = interp1d(x, y, kind=kind, bounds_error=False)
                         assert_allclose(f(xnew), y, atol=1e-7,
-                                        err_msg="%s, %s %s" % (dtx, dty, dtn))
+                                        err_msg=f"{dtx}, {dty} {dtn}")
 
     def test_cubic(self):
         # Check the actual implementation of spline interpolation.
@@ -536,7 +539,7 @@ class TestInterp1D:
         try:
             interpolant(test_array)
         except ValueError as err:
-            assert ("{}".format(fail_value) in str(err))
+            assert (f"{fail_value}" in str(err))
 
     def _bounds_check(self, kind='linear'):
         # Test that our handling of out-of-bounds input is correct.
@@ -1204,6 +1207,7 @@ class TestPPoly:
 
         for writeable in (True, False):
             x.flags.writeable = writeable
+            c.flags.writeable = writeable
             f = PPoly(c, x)
             vals = f(xnew)
             assert_(np.isfinite(vals).all())
@@ -1603,7 +1607,7 @@ class TestPPoly:
                                 val = pp(rr, extrapolate=extrapolate)[:,i,j]
                                 cmpval = pp(rr, nu=1,
                                             extrapolate=extrapolate)[:,i,j]
-                                msg = "(%r) r = %s" % (extrapolate, repr(rr),)
+                                msg = f"({extrapolate!r}) r = {repr(rr)}"
                                 assert_allclose((val-y) / cmpval, 0, atol=1e-7,
                                                 err_msg=msg)
 
