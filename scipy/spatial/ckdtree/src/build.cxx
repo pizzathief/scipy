@@ -13,6 +13,10 @@
 #include <stdexcept>
 #include <ios>
 
+#if defined(__cplusplus)
+using std::isinf;
+#endif
+
 #define tree_buffer_root(buf) (&(buf)[0][0])
 
 static ckdtree_intp_t
@@ -25,7 +29,7 @@ build(ckdtree *self, ckdtree_intp_t start_idx, intptr_t end_idx,
     const double *data = self->raw_data;
     ckdtree_intp_t *indices = (intptr_t *)(self->raw_indices);
 
-    ckdtreenode new_node, *n, *root;
+    ckdtreenode new_node = {}, *n, *root;
     ckdtree_intp_t node_index, _less, _greater;
     ckdtree_intp_t i, j, p, d;
     double size, split, minval, maxval;
@@ -140,7 +144,7 @@ build(ckdtree *self, ckdtree_intp_t start_idx, intptr_t end_idx,
         }
 
         if (CKDTREE_UNLIKELY(p == start_idx || p == end_idx)) {
-            // All children are equal in this dimenion, try again with new bounds
+            // All children are equal in this dimension, try again with new bounds
             assert(!_compact);
             self->tree_buffer->pop_back();
             std::vector<double> tmp_bounds(2 * m);

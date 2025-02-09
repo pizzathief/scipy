@@ -10,7 +10,6 @@ __all__ = [  # noqa: F822
     "tplquad",
     "nquad",
     "IntegrationWarning",
-    "error",
 ]
 
 
@@ -20,5 +19,5 @@ def __dir__():
 
 def __getattr__(name):
     return _sub_module_deprecation(sub_package="integrate", module="quadpack",
-                                   private_module="_quadpack_py", all=__all__,
+                                   private_modules=["_quadpack_py"], all=__all__,
                                    attribute=name)

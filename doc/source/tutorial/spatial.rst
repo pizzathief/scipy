@@ -1,6 +1,6 @@
 .. _qhulltutorial:
 
-Spatial data structures and algorithms (`scipy.spatial`)
+Spatial Data Structures and Algorithms (`scipy.spatial`)
 ========================================================
 
 .. currentmodule:: scipy.spatial
@@ -294,7 +294,7 @@ with the settings of this ``mandala`` function to create your own!
    >>> import matplotlib.pyplot as plt
 
    >>> def mandala(n_iter, n_points, radius):
-   ...     """Creates a mandala figure using Voronoi tesselations.
+   ...     """Creates a mandala figure using Voronoi tessellations.
    ...
    ...     Parameters
    ...     ----------

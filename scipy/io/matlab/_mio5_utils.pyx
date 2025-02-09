@@ -60,7 +60,7 @@ DEF _N_MXS = 20
 from . cimport _streams
 from scipy.io.matlab._mio_utils import squeeze_element, chars_to_strings
 import scipy.io.matlab._mio5_params as mio5p
-from scipy.sparse import csc_matrix
+from scipy.sparse import csc_array
 
 
 cdef enum:
@@ -405,7 +405,7 @@ cdef class VarReader5:
                 self.cstream.seek(8 - mod8, 1)
         return 0
 
-    cpdef cnp.ndarray read_numeric(self, int copy=True, size_t nnz=-1) noexcept:
+    cpdef cnp.ndarray read_numeric(self, int copy=True, size_t nnz=-1):
         ''' Read numeric data element into ndarray
 
         Reads element, then casts to ndarray.
@@ -452,7 +452,7 @@ cdef class VarReader5:
             el_count = byte_count // dt.itemsize
         cdef int flags = 0
         if copy:
-            flags = cnp.NPY_WRITEABLE
+            flags = cnp.NPY_ARRAY_WRITEABLE
         Py_INCREF(<object> dt)
         el = PyArray_NewFromDescr(&PyArray_Type,
                                    dt,
@@ -557,7 +557,7 @@ cdef class VarReader5:
             byte_count[0] = u4s[1]
         return 0
 
-    cpdef VarHeader5 read_header(self, int check_stream_limit) noexcept:
+    cpdef VarHeader5 read_header(self, int check_stream_limit):
         ''' Return matrix header for current stream position
 
         Returns matrix headers at top level and sub levels
@@ -645,7 +645,7 @@ cdef class VarReader5:
 
         Returns
         -------
-        arr : ndarray or sparse matrix
+        arr : ndarray or sparse csc_array
         '''
         cdef:
             VarHeader5 header
@@ -674,7 +674,7 @@ cdef class VarReader5:
 
         Returns
         -------
-        arr : array or sparse array
+        arr : array or sparse csc_array
            read array
         '''
         cdef:
@@ -749,7 +749,7 @@ cdef class VarReader5:
             shape = tuple([x for x in shape if x != 1])
         return shape
 
-    cpdef cnp.ndarray read_real_complex(self, VarHeader5 header) noexcept:
+    cpdef cnp.ndarray read_real_complex(self, VarHeader5 header):
         ''' Read real / complex matrices from stream '''
         cdef:
             cnp.ndarray res, res_j
@@ -799,11 +799,9 @@ cdef class VarReader5:
         # stored in column order, this gives the column corresponding
         # to each rowind
 
-        return csc_matrix(
-            (data[:nnz], rowind[:nnz], indptr),
-            shape=(M, N))
+        return csc_array((data[:nnz], rowind[:nnz], indptr), shape=(M, N))
 
-    cpdef cnp.ndarray read_char(self, VarHeader5 header) noexcept:
+    cpdef cnp.ndarray read_char(self, VarHeader5 header):
         ''' Read char matrices from stream as arrays
 
         Matrices of char are likely to be converted to matrices of
@@ -872,7 +870,7 @@ cdef class VarReader5:
                           buffer=arr,
                           order='F')
 
-    cpdef cnp.ndarray read_cells(self, VarHeader5 header) noexcept:
+    cpdef cnp.ndarray read_cells(self, VarHeader5 header):
         ''' Read cell array from stream '''
         cdef:
             size_t i
@@ -928,7 +926,7 @@ cdef class VarReader5:
         n_names_ptr[0] = n_names
         return field_names
 
-    cpdef cnp.ndarray read_struct(self, VarHeader5 header) noexcept:
+    cpdef cnp.ndarray read_struct(self, VarHeader5 header):
         ''' Read struct or object array from stream
 
         Objects are just structs with an extra field *classname*,

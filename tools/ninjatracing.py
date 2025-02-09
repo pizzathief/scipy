@@ -27,7 +27,7 @@ the profiling results.
 
 import json
 import os
-import optparse
+import argparse
 import re
 import sys
 
@@ -46,9 +46,9 @@ def read_targets(log, show_all):
     time"""
     header = log.readline()
     m = re.search(r'^# ninja log v(\d+)\n$', header)
-    assert m, "unrecognized ninja log version %r" % header
+    assert m, f"unrecognized ninja log version {header!r}"
     version = int(m.group(1))
-    assert 5 <= version <= 6, "unsupported ninja log version %d" % version
+    assert 5 <= version <= 6, f"unsupported ninja log version {version}"
     if version == 6:
         # Skip header line
         next(log)
@@ -124,11 +124,9 @@ def embed_time_trace(ninja_log_dir, target, pid, tid, options):
         o_path = os.path.join(ninja_log_dir, t)
         json_trace_path = os.path.splitext(o_path)[0] + '.json'
         try:
-            with open(json_trace_path, 'r') as trace:
-                for time_trace_event in trace_to_dicts(target, trace, options,
-                                                       pid, tid):
-                    yield time_trace_event
-        except IOError:
+            with open(json_trace_path) as trace:
+                yield from trace_to_dicts(target, trace, options, pid, tid)
+        except OSError:
             pass
 
 
@@ -140,7 +138,7 @@ def log_to_dicts(log, pid, options):
         tid = threads.alloc(target)
 
         yield {
-            'name': '%0s' % ', '.join(target.targets), 'cat': 'targets',
+            'name': '{:0s}'.format(', '.join(target.targets)), 'cat': 'targets',
             'ph': 'X', 'ts': (target.start * 1000),
             'dur': ((target.end - target.start) * 1000),
             'pid': pid, 'tid': tid, 'args': {},
@@ -151,37 +149,31 @@ def log_to_dicts(log, pid, options):
                 ninja_log_dir = os.path.dirname(log.name)
             except AttributeError:
                 continue
-            for time_trace in embed_time_trace(ninja_log_dir, target, pid,
-                                               tid, options):
-                yield time_trace
+            yield from embed_time_trace(ninja_log_dir, target, pid, tid, options)
 
 
 def main(argv):
     usage = __doc__
-    parser = optparse.OptionParser(usage)
-    parser.add_option('-a', '--showall', action='store_true', dest='showall',
-                      default=False,
-                      help='report on last build step for all outputs. Default '
-                      'is to report just on the last (possibly incremental) '
-                      'build')
-    parser.add_option('-g', '--granularity', type='int', default=50000,
-                      dest='granularity',
-                      help='minimum length time-trace event to embed in '
-                      'microseconds. Default: %default')
-    parser.add_option('-e', '--embed-time-trace', action='store_true',
-                      default=False, dest='embed_time_trace',
-                      help='embed clang -ftime-trace json file found adjacent '
-                      'to a target file')
-    (options, args) = parser.parse_args()
-
-    if len(args) == 0:
-      print('Must specify at least one .ninja_log file')
-      parser.print_help()
-      return 1
+    parser = argparse.ArgumentParser(usage)
+    parser.add_argument("logfiles", nargs="*", help=argparse.SUPPRESS)
+    parser.add_argument('-a', '--showall', action='store_true',
+                        dest='showall', default=False,
+                        help='report on last build step for all outputs. '
+                              'Default is to report just on the last '
+                              '(possibly incremental) build')
+    parser.add_argument('-g', '--granularity', type=int, default=50000,
+                        dest='granularity',
+                        help='minimum length time-trace event to embed in '
+                             'microseconds. Default: 50000')
+    parser.add_argument('-e', '--embed-time-trace', action='store_true',
+                        default=False, dest='embed_time_trace',
+                        help='embed clang -ftime-trace json file found '
+                             'adjacent to a target file')
+    options = parser.parse_args()
 
     entries = []
-    for pid, log_file in enumerate(args):
-        with open(log_file, 'r') as log:
+    for pid, log_file in enumerate(options.logfiles):
+        with open(log_file) as log:
             entries += list(log_to_dicts(log, pid, vars(options)))
     json.dump(entries, sys.stdout)
 

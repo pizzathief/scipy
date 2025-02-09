@@ -48,14 +48,14 @@ multiplication as default for the ``*`` operator, and contains ``I``
 and ``T`` members that serve as shortcuts for inverse and transpose:
 
     >>> import numpy as np
-    >>> A = np.mat('[1 2;3 4]')
+    >>> A = np.asmatrix('[1 2;3 4]')
     >>> A
     matrix([[1, 2],
             [3, 4]])
     >>> A.I
     matrix([[-2. ,  1. ],
             [ 1.5, -0.5]])
-    >>> b = np.mat('[5 6]')
+    >>> b = np.asmatrix('[5 6]')
     >>> b
     matrix([[5, 6]])
     >>> b.T
@@ -278,20 +278,20 @@ Examples:
 
     >>> import numpy as np
     >>> from scipy import linalg
-    >>> A=np.array([[1,2],[3,4]])
+    >>> A=np.array([[1, 2], [3, 4]])
     >>> A
     array([[1, 2],
           [3, 4]])
     >>> linalg.norm(A)
     5.4772255750516612
-    >>> linalg.norm(A,'fro') # frobenius norm is the default
+    >>> linalg.norm(A, 'fro') # frobenius norm is the default
     5.4772255750516612
-    >>> linalg.norm(A,1) # L1 norm (max column sum)
-    6
-    >>> linalg.norm(A,-1)
-    4
-    >>> linalg.norm(A,np.inf) # L inf norm (max row sum)
-    7
+    >>> linalg.norm(A, 1) # L1 norm (max column sum)
+    6.0
+    >>> linalg.norm(A, -1)
+    4.0
+    >>> linalg.norm(A, np.inf) # L inf norm (max row sum)
+    7.0
 
 
 Solving linear least-squares problems and pseudo-inverses
@@ -723,7 +723,7 @@ functions of matrices.
 The following example illustrates the Schur decomposition:
 
     >>> from scipy import linalg
-    >>> A = np.mat('[1 3 2; 1 4 5; 2 3 6]')
+    >>> A = np.asmatrix('[1 3 2; 1 4 5; 2 3 6]')
     >>> T, Z = linalg.schur(A)
     >>> T1, Z1 = linalg.schur(A, 'complex')
     >>> T2, Z2 = linalg.rsf2csf(T, Z)
@@ -746,7 +746,7 @@ The following example illustrates the Schur decomposition:
     array([[ 0.06833781,  0.88091091,  0.79568503],    # may vary
            [ 0.11857169,  0.44491892,  0.99594171],
            [ 0.12624999,  0.60264117,  0.77257633]])
-    >>> T, Z, T1, Z1, T2, Z2 = map(np.mat,(T,Z,T1,Z1,T2,Z2))
+    >>> T, Z, T1, Z1, T2, Z2 = map(np.asmatrix,(T,Z,T1,Z1,T2,Z2))
     >>> abs(A - Z*T*Z.H)  # same
     matrix([[  5.55111512e-16,   1.77635684e-15,   2.22044605e-15],
             [  0.00000000e+00,   3.99680289e-15,   8.88178420e-16],
@@ -809,7 +809,7 @@ square matrix :math:`\mathbf{A}` as
 
     While this serves as a useful representation of a matrix function, it is
     rarely the best way to calculate a matrix function. In particular, if the
-    matrix is not diagonalizable, results may be innacurate.
+    matrix is not diagonalizable, results may be inaccurate.
 
 
 Exponential and logarithm functions
@@ -956,3 +956,21 @@ Van der Monde         `numpy.vander`                     Create a Van der Monde 
 
 
 For examples of the use of these functions, see their respective docstrings.
+
+Advanced Features
+-----------------
+
+Batch Support
+^^^^^^^^^^^^^
+Some of SciPy's linear algebra functions can process batches of scalars, 1D-, or
+2D-arrays given N-d array input.
+For example, a linear algebra function that typically accepts a (2D) matrix may accept
+an array of shape ``(4, 3, 2)``, which it would interpret as a batch of four 3-by-2
+matrices. In this case, we say that the the *core shape* of the input is (3, 2) and the
+*batch shape* is ``(4,)``. Likewise, a linear algebra function that typically accepts
+a (1D) vector would treat a ``(4, 3, 2)`` array as a ``(4, 3)`` batch of vectors,
+in which case the *core shape* of the input is ``(2,)`` and the *batch shape* is
+``(4, 3)``. The length of the core shape is also referred to as the *core dimension*.
+In these cases, the final shape of the output is the batch shape of the input
+concatenated with the core shape of the output (i.e., the shape of the output when
+the batch shape of the input is ``()``). For more information, see :doc:`linalg_batch`.

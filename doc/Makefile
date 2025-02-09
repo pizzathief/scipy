@@ -35,7 +35,7 @@ help:
 	@echo "  show      to show the HTML output"
 
 clean:
-	-rm -rf build/* source/reference/generated
+	-rm -rf build/* source/reference/generated source/.jupyterlite.doit.db
 
 
 #------------------------------------------------------------------------------
@@ -52,9 +52,10 @@ clean:
 
 UPLOAD_DIR=/srv/docs_scipy_org/doc/scipy-$(RELEASE)
 
+# `set -o pipefail` is specific to bash
+SHELL = /bin/bash
 SCIPYVER:=$(shell $(PYTHON) -c "import scipy; print(scipy.version.git_revision[:10])" 2>/dev/null)
-GITVER ?= $(shell cd ../tools; $(PYTHON) -c "from version_utils import git_version; \
-				print(git_version('..')[0][:10])")
+GITVER ?= $(shell (cd ..; set -o pipefail && git rev-parse HEAD 2>/dev/null | cut -c1-10) || echo Unknown)
 
 version-check:
 ifeq "$(GITVER)" "Unknown"
@@ -75,7 +76,7 @@ dist:
 	install -d build
 	rm -rf build/env
 	$(PYTHON) -mvenv --system-site-packages build/env
-	$(CURDIR)/build/env/bin/python -mpip install -r ../doc_requirements.txt
+	$(CURDIR)/build/env/bin/python -mpip install -r ../requirements/doc.txt
 	$(CURDIR)/build/env/bin/python -mpip install ..
 	make PYTHON="$(CURDIR)/build/env/bin/python" doc-dist
 

@@ -2,6 +2,7 @@ from inspect import Parameter, signature
 import functools
 import warnings
 from importlib import import_module
+from scipy._lib._docscrape import FunctionDoc
 
 
 __all__ = ["_deprecated"]
@@ -11,8 +12,8 @@ __all__ = ["_deprecated"]
 # be used over 'None' as the user could parse 'None' as a positional argument
 _NoValue = object()
 
-def _sub_module_deprecation(*, sub_package, module, private_module, all,
-                            attribute, correct_module=None):
+def _sub_module_deprecation(*, sub_package, module, private_modules, all,
+                            attribute, correct_module=None, dep_version="1.16.0"):
     """Helper function for deprecating modules that are public but were
     intended to be private.
 
@@ -22,8 +23,9 @@ def _sub_module_deprecation(*, sub_package, module, private_module, all,
         Subpackage the module belongs to eg. stats
     module : str
         Public but intended private module to deprecate
-    private_module : str
-        Private replacement for `module`
+    private_modules : list
+        Private replacement(s) for `module`; should contain the
+        content of ``all``, possibly spread over several modules.
     all : list
         ``__all__`` belonging to `module`
     attribute : str
@@ -31,6 +33,8 @@ def _sub_module_deprecation(*, sub_package, module, private_module, all,
     correct_module : str, optional
         Module in `sub_package` that `attribute` should be imported from.
         Default is that `attribute` should be imported from ``scipy.sub_package``.
+    dep_version : str, optional
+        Version in which deprecated attributes will be removed.
     """
     if correct_module is not None:
         correct_import = f"scipy.{sub_package}.{correct_module}"
@@ -39,25 +43,39 @@ def _sub_module_deprecation(*, sub_package, module, private_module, all,
 
     if attribute not in all:
         raise AttributeError(
-            f"`scipy.{sub_package}.{module}` has no attribute `{attribute}`; furthermore, "
-            f"`scipy.{sub_package}.{module}` is deprecated and will be removed in "
-            "SciPy 2.0.0.")
+            f"`scipy.{sub_package}.{module}` has no attribute `{attribute}`; "
+            f"furthermore, `scipy.{sub_package}.{module}` is deprecated "
+            f"and will be removed in SciPy 2.0.0."
+        )
 
     attr = getattr(import_module(correct_import), attribute, None)
 
     if attr is not None:
-        message = (f"Please import `{attribute}` from the `{correct_import}` namespace; "
-                   f"the `scipy.{sub_package}.{module}` namespace is deprecated and "
-                   "will be removed in SciPy 2.0.0.")
+        message = (
+            f"Please import `{attribute}` from the `{correct_import}` namespace; "
+            f"the `scipy.{sub_package}.{module}` namespace is deprecated "
+            f"and will be removed in SciPy 2.0.0."
+        )
     else:
-        message = (f"`scipy.{sub_package}.{module}.{attribute}` is deprecated along with "
-                   f"the `scipy.{sub_package}.{module}` namespace. "
-                   f"`scipy.{sub_package}.{module}.{attribute}` will be removed in SciPy 1.13.0, and "
-                   f"the `scipy.{sub_package}.{module}` namespace will be removed in SciPy 2.0.0.")
+        message = (
+            f"`scipy.{sub_package}.{module}.{attribute}` is deprecated along with "
+            f"the `scipy.{sub_package}.{module}` namespace. "
+            f"`scipy.{sub_package}.{module}.{attribute}` will be removed "
+            f"in SciPy {dep_version}, and the `scipy.{sub_package}.{module}` namespace "
+            f"will be removed in SciPy 2.0.0."
+        )
 
     warnings.warn(message, category=DeprecationWarning, stacklevel=3)
 
-    return getattr(import_module(f"scipy.{sub_package}.{private_module}"), attribute)
+    for module in private_modules:
+        try:
+            return getattr(import_module(f"scipy.{sub_package}.{module}"), attribute)
+        except AttributeError as e:
+            # still raise an error if the attribute isn't in any of the expected
+            # private modules
+            if module == private_modules[-1]:
+                raise e
+            continue
     
 
 def _deprecated(msg, stacklevel=2):
@@ -135,10 +153,9 @@ def deprecate_cython_api(module, routine_name, new_name=None, message=None):
     old_name = f"{module.__name__}.{routine_name}"
 
     if new_name is None:
-        depdoc = "`%s` is deprecated!" % old_name
+        depdoc = f"`{old_name}` is deprecated!"
     else:
-        depdoc = "`%s` is deprecated, use `%s` instead!" % \
-                 (old_name, new_name)
+        depdoc = f"`{old_name}` is deprecated, use `{new_name}` instead!"
 
     if message is not None:
         depdoc += "\n" + message
@@ -164,7 +181,8 @@ def deprecate_cython_api(module, routine_name, new_name=None, message=None):
 
 # taken from scikit-learn, see
 # https://github.com/scikit-learn/scikit-learn/blob/1.3.0/sklearn/utils/validation.py#L38
-def _deprecate_positional_args(func=None, *, version=None):
+def _deprecate_positional_args(func=None, *, version=None,
+                               deprecated_args=None, custom_message=""):
     """Decorator for methods that issues warnings for positional arguments.
 
     Using the keyword-only argument syntax in pep 3102, arguments after the
@@ -176,10 +194,16 @@ def _deprecate_positional_args(func=None, *, version=None):
         Function to check arguments on.
     version : callable, default=None
         The version when positional arguments will result in error.
+    deprecated_args : set of str, optional
+        Arguments to deprecate - whether passed by position or keyword.
+    custom_message : str, optional
+        Custom message to add to deprecation warning and documentation.
     """
     if version is None:
         msg = "Need to specify a version where signature will be changed"
         raise ValueError(msg)
+
+    deprecated_args = set() if deprecated_args is None else set(deprecated_args)
 
     def _inner_deprecate_positional_args(f):
         sig = signature(f)
@@ -192,21 +216,29 @@ def _deprecate_positional_args(func=None, *, version=None):
             elif param.kind == Parameter.KEYWORD_ONLY:
                 kwonly_args.append(name)
 
+        def warn_deprecated_args(kwargs):
+            intersection = deprecated_args.intersection(kwargs)
+            if intersection:
+                message = (f"Arguments {intersection} are deprecated, whether passed "
+                           "by position or keyword. They will be removed in SciPy "
+                           f"{version}. ")
+                message += custom_message
+                warnings.warn(message, category=DeprecationWarning, stacklevel=3)
+
         @functools.wraps(f)
         def inner_f(*args, **kwargs):
+
             extra_args = len(args) - len(all_args)
             if extra_args <= 0:
+                warn_deprecated_args(kwargs)
                 return f(*args, **kwargs)
 
             # extra_args > 0
-            args_msg = [
-                f"{name}={arg}"
-                for name, arg in zip(kwonly_args[:extra_args], args[-extra_args:])
-            ]
-            args_msg = ", ".join(args_msg)
+            kwonly_extra_args = set(kwonly_args[:extra_args]) - deprecated_args
+            args_msg = ", ".join(kwonly_extra_args)
             warnings.warn(
                 (
-                    f"You are passing {args_msg} as a positional argument. "
+                    f"You are passing as positional arguments: {args_msg}. "
                     "Please change your invocation to use keyword arguments. "
                     f"From SciPy {version}, passing these as positional "
                     "arguments will result in an error."
@@ -215,7 +247,24 @@ def _deprecate_positional_args(func=None, *, version=None):
                 stacklevel=2,
             )
             kwargs.update(zip(sig.parameters, args))
+            warn_deprecated_args(kwargs)
             return f(**kwargs)
+
+        doc = FunctionDoc(inner_f)
+        kwonly_extra_args = set(kwonly_args) - deprecated_args
+        admonition = f"""
+.. deprecated:: {version}
+    Use of argument(s) ``{kwonly_extra_args}`` by position is deprecated; beginning in 
+    SciPy {version}, these will be keyword-only. """
+        if deprecated_args:
+            admonition += (f"Argument(s) ``{deprecated_args}`` are deprecated, whether "
+                           "passed by position or keyword; they will be removed in "
+                           f"SciPy {version}. ")
+        admonition += custom_message
+        doc['Extended Summary'] += [admonition]
+
+        doc = str(doc).split("\n", 1)[1]  # remove signature
+        inner_f.__doc__ = str(doc)
 
         return inner_f
 

@@ -25,24 +25,24 @@ __all__ = ['fmin', 'fmin_powell', 'fmin_bfgs', 'fmin_ncg', 'fmin_cg',
 
 __docformat__ = "restructuredtext en"
 
+import math
 import warnings
 import sys
 import inspect
-from numpy import (atleast_1d, eye, argmin, zeros, shape, squeeze,
-                   asarray, sqrt)
+from numpy import eye, argmin, zeros, shape, asarray, sqrt
 import numpy as np
+from scipy.linalg import cholesky, issymmetric, LinAlgError
 from scipy.sparse.linalg import LinearOperator
 from ._linesearch import (line_search_wolfe1, line_search_wolfe2,
                           line_search_wolfe2 as line_search,
                           LineSearchWarning)
 from ._numdiff import approx_derivative
-from ._hessian_update_strategy import HessianUpdateStrategy
 from scipy._lib._util import getfullargspec_no_self as _getfullargspec
-from scipy._lib._util import MapWrapper, check_random_state
+from scipy._lib._util import (MapWrapper, check_random_state, _RichResult,
+                              _call_callback_maybe_halt, _transition_to_rng)
 from scipy.optimize._differentiable_functions import ScalarFunction, FD_METHODS
-
-# deprecated imports to be removed in SciPy 1.13.0
-from numpy import asfarray  # noqa
+from scipy._lib._array_api import array_namespace
+from scipy._lib import array_api_extra as xpx
 
 
 # standard status messages of optimizers
@@ -59,8 +59,8 @@ _status_message = {'success': 'Optimization terminated successfully.',
 
 
 class MemoizeJac:
-    """ Decorator that caches the return values of a function returning `(fun, grad)`
-        each time it is called. """
+    """Decorator that caches the return values of a function returning ``(fun, grad)``
+    each time it is called."""
 
     def __init__(self, fun):
         self.fun = fun
@@ -85,59 +85,9 @@ class MemoizeJac:
         return self.jac
 
 
-def _indenter(s, n=0):
-    """
-    Ensures that lines after the first are indented by the specified amount
-    """
-    split = s.split("\n")
-    indent = " "*n
-    return ("\n" + indent).join(split)
-
-
-def _float_formatter_10(x):
-    """
-    Returns a string representation of a float with exactly ten characters
-    """
-    if np.isposinf(x):
-        return "       inf"
-    elif np.isneginf(x):
-        return "      -inf"
-    elif np.isnan(x):
-        return "       nan"
-    return np.format_float_scientific(x, precision=3, pad_left=2, unique=False)
-
-
-def _dict_formatter(d, n=0, mplus=1, sorter=None):
-    """
-    Pretty printer for dictionaries
-
-    `n` keeps track of the starting indentation;
-    lines are indented by this much after a line break.
-    `mplus` is additional left padding applied to keys
-    """
-    if isinstance(d, dict):
-        m = max(map(len, list(d.keys()))) + mplus  # width to print keys
-        s = '\n'.join([k.rjust(m) + ': ' +  # right justified, width m
-                       _indenter(_dict_formatter(v, m+n+2, 0, sorter), m+2)
-                       for k, v in sorter(d)])  # +2 for ': '
-    else:
-        # By default, NumPy arrays print with linewidth=76. `n` is
-        # the indent at which a line begins printing, so it is subtracted
-        # from the default to avoid exceeding 76 characters total.
-        # `edgeitems` is the number of elements to include before and after
-        # ellipses when arrays are not shown in full.
-        # `threshold` is the maximum number of elements for which an
-        # array is shown in full.
-        # These values tend to work well for use with OptimizeResult.
-        with np.printoptions(linewidth=76-n, edgeitems=2, threshold=12,
-                             formatter={'float_kind': _float_formatter_10}):
-            s = str(d)
-    return s
-
-
 def _wrap_callback(callback, method=None):
     """Wrap a user-provided callback so that attributes can be attached."""
-    if callback is None or method in {'tnc', 'slsqp', 'cobyla'}:
+    if callback is None or method in {'tnc', 'slsqp', 'cobyla', 'cobyqa'}:
         return callback  # don't wrap
 
     sig = inspect.signature(callback)
@@ -159,34 +109,9 @@ def _wrap_callback(callback, method=None):
     return wrapped_callback
 
 
-def _call_callback_maybe_halt(callback, res):
-    """Call wrapped callback; return True if minimization should stop.
-
-    Parameters
-    ----------
-    callback : callable or None
-        A user-provided callback wrapped with `_wrap_callback`
-    res : OptimizeResult
-        Information about the current iterate
-
-    Returns
-    -------
-    halt : bool
-        True if minimization should stop
-
+class OptimizeResult(_RichResult):
     """
-    if callback is None:
-        return False
-    try:
-        callback(res)
-        return False
-    except StopIteration:
-        callback.stop_iteration = True  # make `minimize` override status/msg
-        return True
-
-
-class OptimizeResult(dict):
-    """ Represents the optimization result.
+    Represents the optimization result.
 
     Attributes
     ----------
@@ -199,9 +124,11 @@ class OptimizeResult(dict):
         underlying solver. Refer to `message` for details.
     message : str
         Description of the cause of the termination.
-    fun, jac, hess: ndarray
-        Values of objective function, its Jacobian and its Hessian (if
-        available). The Hessians may be approximations, see the documentation
+    fun : float
+        Value of objective function at `x`.
+    jac, hess : ndarray
+        Values of objective function's Jacobian and its Hessian at `x` (if
+        available). The Hessian may be an approximation, see the documentation
         of the function in question.
     hess_inv : object
         Inverse of the objective function's Hessian; may be an approximation.
@@ -222,53 +149,27 @@ class OptimizeResult(dict):
     attributes not listed here. Since this class is essentially a
     subclass of dict with attribute accessors, one can see which
     attributes are available using the `OptimizeResult.keys` method.
+
     """
-
-    def __getattr__(self, name):
-        try:
-            return self[name]
-        except KeyError as e:
-            raise AttributeError(name) from e
-
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-
-    def __repr__(self):
-        order_keys = ['message', 'success', 'status', 'fun', 'funl', 'x', 'xl',
-                      'col_ind', 'nit', 'lower', 'upper', 'eqlin', 'ineqlin',
-                      'converged', 'flag', 'function_calls', 'iterations',
-                      'root']
-        order_keys = getattr(self, '_order_keys', order_keys)
-        # 'slack', 'con' are redundant with residuals
-        # 'crossover_nit' is probably not interesting to most users
-        omit_keys = {'slack', 'con', 'crossover_nit', '_order_keys'}
-
-        def key(item):
-            try:
-                return order_keys.index(item[0].lower())
-            except ValueError:  # item not in list
-                return np.inf
-
-        def omit_redundant(items):
-            for item in items:
-                if item[0] in omit_keys:
-                    continue
-                yield item
-
-        def item_sorter(d):
-            return sorted(omit_redundant(d.items()), key=key)
-
-        if self.keys():
-            return _dict_formatter(self, sorter=item_sorter)
-        else:
-            return self.__class__.__name__ + "()"
-
-    def __dir__(self):
-        return list(self.keys())
+    pass
 
 
 class OptimizeWarning(UserWarning):
     pass
+
+def _check_positive_definite(Hk):
+    def is_pos_def(A):
+        if issymmetric(A):
+            try:
+                cholesky(A)
+                return True
+            except LinAlgError:
+                return False
+        else:
+            return False
+    if Hk is not None:
+        if not is_pos_def(Hk):
+            raise ValueError("'hess_inv0' matrix isn't positive definite.")
 
 
 def _check_unknown_options(unknown_options):
@@ -277,7 +178,7 @@ def _check_unknown_options(unknown_options):
         # Stack level 4: this is called from _minimize_*, which is
         # called from another function in SciPy. Level 4 is the first
         # level in user code.
-        warnings.warn("Unknown solver options: %s" % msg, OptimizeWarning, 4)
+        warnings.warn(f"Unknown solver options: {msg}", OptimizeWarning, stacklevel=4)
 
 
 def is_finite_scalar(x):
@@ -301,7 +202,7 @@ def vecnorm(x, ord=2):
 
 def _prepare_scalar_function(fun, x0, jac=None, args=(), bounds=None,
                              epsilon=None, finite_diff_rel_step=None,
-                             hess=None):
+                             hess=None, workers=None):
     """
     Creates a ScalarFunction object for use with scalar minimizers
     (BFGS/LBFGSB/SLSQP/TNC/CG/etc).
@@ -334,10 +235,10 @@ def _prepare_scalar_function(fun, x0, jac=None, args=(), bounds=None,
     bounds : sequence, optional
         Bounds on variables. 'new-style' bounds are required.
     eps : float or ndarray
-        If `jac is None` the absolute step size used for numerical
+        If ``jac is None`` the absolute step size used for numerical
         approximation of the jacobian via forward differences.
     finite_diff_rel_step : None or array_like, optional
-        If `jac in ['2-point', '3-point', 'cs']` the relative step size to
+        If ``jac in ['2-point', '3-point', 'cs']`` the relative step size to
         use for numerical approximation of the jacobian. The absolute step
         size is computed as ``h = rel_step * sign(x0) * max(1, abs(x0))``,
         possibly adjusted to fit into the bounds. For ``jac='3-point'``
@@ -354,6 +255,21 @@ def _prepare_scalar_function(fun, x0, jac=None, args=(), bounds=None,
         Whenever the gradient is estimated via finite-differences, the Hessian
         cannot be estimated with options {'2-point', '3-point', 'cs'} and needs
         to be estimated using one of the quasi-Newton strategies.
+    workers : int or map-like callable, optional
+        A map-like callable, such as `multiprocessing.Pool.map` for evaluating
+        any numerical differentiation in parallel.
+        This evaluation is carried out as ``workers(fun, iterable)``, or
+        ``workers(grad, iterable)``, depending on what is being numerically
+        differentiated.
+        Alternatively, if `workers` is an int the task is subdivided into `workers`
+        sections and the function evaluated in parallel
+        (uses `multiprocessing.Pool <multiprocessing>`).
+        Supply -1 to use all available CPU cores.
+        It is recommended that a map-like be used instead of int, as repeated
+        calls to `approx_derivative` will incur large overhead from setting up
+        new processes.
+
+        .. versionadded:: 1.16.0
 
     Returns
     -------
@@ -385,10 +301,14 @@ def _prepare_scalar_function(fun, x0, jac=None, args=(), bounds=None,
     if bounds is None:
         bounds = (-np.inf, np.inf)
 
+    # normalize workers
+    workers = workers or map
+
     # ScalarFunction caches. Reuse of fun(x) during grad
     # calculation reduces overall function evaluations.
     sf = ScalarFunction(fun, x0, args, grad, hess,
-                        finite_diff_rel_step, bounds, epsilon=epsilon)
+                        finite_diff_rel_step, bounds, epsilon=epsilon,
+                        workers=workers)
 
     return sf
 
@@ -409,7 +329,8 @@ def _clip_x_for_func(func, bounds):
 def _check_clip_x(x, bounds):
     if (x < bounds[0]).any() or (x > bounds[1]).any():
         warnings.warn("Values in x were outside bounds during a "
-                      "minimize step, clipping to bounds", RuntimeWarning)
+                      "minimize step, clipping to bounds",
+                      RuntimeWarning, stacklevel=3)
         x = np.clip(x, bounds[0], bounds[1])
         return x
 
@@ -458,9 +379,12 @@ def rosen(x):
     >>> ax.plot_surface(X, Y, rosen([X, Y]))
     >>> plt.show()
     """
-    x = asarray(x)
-    r = np.sum(100.0 * (x[1:] - x[:-1]**2.0)**2.0 + (1 - x[:-1])**2.0,
-                  axis=0)
+    xp = array_namespace(x)
+    x = xp.asarray(x)
+    if xp.isdtype(x.dtype, 'integral'):
+        x = xp.astype(x, xp.asarray(1.).dtype)
+    r = xp.sum(100.0 * (x[1:] - x[:-1]**2.0)**2.0 + (1 - x[:-1])**2.0,
+               axis=0, dtype=x.dtype)
     return r
 
 
@@ -491,11 +415,14 @@ def rosen_der(x):
     array([ -2. ,  10.6,  15.6,  13.4,   6.4,  -3. , -12.4, -19.4,  62. ])
 
     """
-    x = asarray(x)
+    xp = array_namespace(x)
+    x = xp.asarray(x)
+    if xp.isdtype(x.dtype, 'integral'):
+        x = xp.astype(x, xp.asarray(1.).dtype)
     xm = x[1:-1]
     xm_m1 = x[:-2]
     xm_p1 = x[2:]
-    der = np.zeros_like(x)
+    der = xp.zeros_like(x)
     der[1:-1] = (200 * (xm - xm_m1**2) -
                  400 * (xm_p1 - xm**2) * xm - 2 * (1 - xm))
     der[0] = -400 * x[0] * (x[1] - x[0]**2) - 2 * (1 - x[0])
@@ -533,14 +460,17 @@ def rosen_hess(x):
            [  0.,   0., -80., 200.]])
 
     """
-    x = atleast_1d(x)
-    H = np.diag(-400 * x[:-1], 1) - np.diag(400 * x[:-1], -1)
-    diagonal = np.zeros(len(x), dtype=x.dtype)
+    xp = array_namespace(x)
+    x = xpx.atleast_nd(x, ndim=1, xp=xp)
+    if xp.isdtype(x.dtype, 'integral'):
+        x = xp.astype(x, xp.asarray(1.).dtype)
+    H = (xpx.create_diagonal(-400 * x[:-1], offset=1, xp=xp) 
+         - xpx.create_diagonal(400 * x[:-1], offset=-1, xp=xp))
+    diagonal = xp.zeros(x.shape[0], dtype=x.dtype)
     diagonal[0] = 1200 * x[0]**2 - 400 * x[1] + 2
     diagonal[-1] = 200
     diagonal[1:-1] = 202 + 1200 * x[1:-1]**2 - 400 * x[2:]
-    H = H + np.diag(diagonal)
-    return H
+    return H + xpx.create_diagonal(diagonal, xp=xp)
 
 
 def rosen_hess_prod(x, p):
@@ -574,8 +504,12 @@ def rosen_hess_prod(x, p):
     array([  -0.,   27.,  -10.,  -95., -192., -265., -278., -195., -180.])
 
     """
-    x = atleast_1d(x)
-    Hp = np.zeros(len(x), dtype=x.dtype)
+    xp = array_namespace(x, p)
+    x = xpx.atleast_nd(x, ndim=1, xp=xp)
+    if xp.isdtype(x.dtype, 'integral'):
+        x = xp.astype(x, xp.asarray(1.).dtype)
+    p = xp.asarray(p, dtype=x.dtype)
+    Hp = xp.zeros(x.shape[0], dtype=x.dtype)
     Hp[0] = (1200 * x[0]**2 - 400 * x[1] + 2) * p[0] - 400 * x[0] * p[1]
     Hp[1:-1] = (-400 * x[:-2] * p[:-2] +
                 (202 + 1200 * x[1:-1]**2 - 400 * x[2:]) * p[1:-1] -
@@ -803,9 +737,9 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
     bounds : sequence or `Bounds`, optional
         Bounds on variables. There are two ways to specify the bounds:
 
-            1. Instance of `Bounds` class.
-            2. Sequence of ``(min, max)`` pairs for each element in `x`. None
-               is used to specify no bound.
+        1. Instance of `Bounds` class.
+        2. Sequence of ``(min, max)`` pairs for each element in `x`. None
+           is used to specify no bound.
 
         Note that this just clips all vertices in simplex based on
         the bounds.
@@ -823,7 +757,8 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
     retall = return_all
 
     x0 = np.atleast_1d(x0).flatten()
-    x0 = np.asfarray(x0, x0.dtype)
+    dtype = x0.dtype if np.issubdtype(x0.dtype, np.inexact) else np.float64
+    x0 = np.asarray(x0, dtype=dtype)
 
     if adaptive:
         dim = float(len(x0))
@@ -844,10 +779,11 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
         lower_bound, upper_bound = bounds.lb, bounds.ub
         # check bounds
         if (lower_bound > upper_bound).any():
-            raise ValueError("Nelder Mead - one of the lower bounds is greater than an upper bound.")
+            raise ValueError("Nelder Mead - one of the lower bounds "
+                             "is greater than an upper bound.")
         if np.any(lower_bound > x0) or np.any(x0 > upper_bound):
             warnings.warn("Initial guess is not within the specified bounds",
-                          OptimizeWarning, 3)
+                          OptimizeWarning, stacklevel=3)
 
     if bounds is not None:
         x0 = np.clip(x0, lower_bound, upper_bound)
@@ -866,7 +802,8 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
             sim[k + 1] = y
     else:
         sim = np.atleast_2d(initial_simplex).copy()
-        sim = np.asfarray(sim, sim.dtype)
+        dtype = sim.dtype if np.issubdtype(sim.dtype, np.inexact) else np.float64
+        sim = np.asarray(sim, dtype=dtype)
         if sim.ndim != 2 or sim.shape[0] != sim.shape[1] + 1:
             raise ValueError("`initial_simplex` should be an array of shape (N+1,N)")
         if len(x0) != sim.shape[1]:
@@ -894,6 +831,15 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
             maxfun = np.inf
 
     if bounds is not None:
+        # The default simplex construction may make all entries (for a given
+        # parameter) greater than an upper bound if x0 is very close to the
+        # upper bound. If one simply clips the simplex to the bounds this could
+        # make the simplex entries degenerate. If that occurs reflect into the
+        # interior.
+        msk = sim > upper_bound
+        # reflect into the interior
+        sim = np.where(msk, 2*upper_bound - sim, sim)
+        # but make sure the reflection is no less than the lower_bound
         sim = np.clip(sim, lower_bound, upper_bound)
 
     one2np1 = list(range(1, N + 1))
@@ -1001,19 +947,19 @@ def _minimize_neldermead(func, x0, args=(), callback=None,
         warnflag = 1
         msg = _status_message['maxfev']
         if disp:
-            warnings.warn(msg, RuntimeWarning, 3)
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
     elif iterations >= maxiter:
         warnflag = 2
         msg = _status_message['maxiter']
         if disp:
-            warnings.warn(msg, RuntimeWarning, 3)
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
     else:
         msg = _status_message['success']
         if disp:
             print(msg)
-            print("         Current function value: %f" % fval)
-            print("         Iterations: %d" % iterations)
-            print("         Function evaluations: %d" % fcalls[0])
+            print(f"         Current function value: {fval:f}")
+            print(f"         Iterations: {iterations:d}")
+            print(f"         Function evaluations: {fcalls[0]:d}")
 
     result = OptimizeResult(fun=fval, nit=iterations, nfev=fcalls[0],
                             status=warnflag, success=(warnflag == 0),
@@ -1043,6 +989,13 @@ def approx_fprime(xk, f, epsilon=_epsilon, *args):
         completely specify the function. The argument `xk` passed to this
         function is an ndarray of shape (n,) (never a scalar even if n=1).
         It must return a 1-D array_like of shape (m,) or a scalar.
+
+        Suppose the callable has signature ``f0(x, *my_args, **my_kwargs)``, where
+        ``my_args`` and ``my_kwargs`` are required positional and keyword arguments.
+        Rather than passing ``f0`` as the callable, wrap it to accept
+        only ``x``; e.g., pass ``fun=lambda x: f0(x, *my_args, **my_kwargs)`` as the
+        callable, where ``my_args`` (tuple) and ``my_kwargs`` (dict) have been
+        gathered before invoking this function.
 
         .. versionchanged:: 1.9.0
             `f` is now able to return a 1-D array-like, with the :math:`(m, n)`
@@ -1087,7 +1040,7 @@ def approx_fprime(xk, f, epsilon=_epsilon, *args):
     >>> c0, c1 = (1, 200)
     >>> eps = np.sqrt(np.finfo(float).eps)
     >>> optimize.approx_fprime(x, func, [eps, np.sqrt(200) * eps], c0, c1)
-    array([   2.        ,  400.00004198])
+    array([   2.        ,  400.00004208])
 
     """
     xk = np.asarray(xk, float)
@@ -1097,9 +1050,10 @@ def approx_fprime(xk, f, epsilon=_epsilon, *args):
                              args=args, f0=f0)
 
 
+@_transition_to_rng("seed", position_num=6)
 def check_grad(func, grad, x0, *args, epsilon=_epsilon,
-                direction='all', seed=None):
-    """Check the correctness of a gradient function by comparing it against a
+                direction='all', rng=None):
+    r"""Check the correctness of a gradient function by comparing it against a
     (forward) finite-difference approximation of the gradient.
 
     Parameters
@@ -1122,17 +1076,15 @@ def check_grad(func, grad, x0, *args, epsilon=_epsilon,
         using `func`. By default it is ``'all'``, in which case, all
         the one hot direction vectors are considered to check `grad`.
         If `func` is a vector valued function then only ``'all'`` can be used.
-    seed : {None, int, `numpy.random.Generator`, `numpy.random.RandomState`}, optional
-        If `seed` is None (or `np.random`), the `numpy.random.RandomState`
-        singleton is used.
-        If `seed` is an int, a new ``RandomState`` instance is used,
-        seeded with `seed`.
-        If `seed` is already a ``Generator`` or ``RandomState`` instance then
-        that instance is used.
-        Specify `seed` for reproducing the return value from this function.
-        The random numbers generated with this seed affect the random vector
-        along which gradients are computed to check ``grad``. Note that `seed`
-        is only used when `direction` argument is set to `'random'`.
+    rng : `numpy.random.Generator`, optional
+        Pseudorandom number generator state. When `rng` is None, a new
+        `numpy.random.Generator` is created using entropy from the
+        operating system. Types other than `numpy.random.Generator` are
+        passed to `numpy.random.default_rng` to instantiate a ``Generator``.
+
+        The random numbers generated affect the random vector along which gradients
+        are computed to check ``grad``. Note that `rng` is only used when `direction`
+        argument is set to `'random'`.
 
     Returns
     -------
@@ -1172,8 +1124,8 @@ def check_grad(func, grad, x0, *args, epsilon=_epsilon,
         if _grad.ndim > 1:
             raise ValueError("'random' can only be used with scalar valued"
                              " func")
-        random_state = check_random_state(seed)
-        v = random_state.normal(0, 1, size=(x0.shape))
+        rng_gen = check_random_state(rng)
+        v = rng_gen.standard_normal(size=(x0.shape))
         _args = (func, x0, v) + args
         _func = g
         vars = np.zeros((1,))
@@ -1184,8 +1136,8 @@ def check_grad(func, grad, x0, *args, epsilon=_epsilon,
         vars = x0
         analytical_grad = grad(x0, *args)
     else:
-        raise ValueError("{} is not a valid string for "
-                         "``direction`` argument".format(direction))
+        raise ValueError(f"{direction} is not a valid string for "
+                         "``direction`` argument")
 
     return np.sqrt(np.sum(np.abs(
         (analytical_grad - approx_fprime(vars, _func, step, *_args))**2
@@ -1250,7 +1202,8 @@ def _line_search_wolfe12(f, fprime, xk, pk, gfk, old_fval, old_old_fval,
 
 def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
               epsilon=_epsilon, maxiter=None, full_output=0, disp=1,
-              retall=0, callback=None, xrtol=0):
+              retall=0, callback=None, xrtol=0, c1=1e-4, c2=0.9,
+              hess_inv0=None):
     """
     Minimize a function using the BFGS algorithm.
 
@@ -1259,7 +1212,7 @@ def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
     f : callable ``f(x,*args)``
         Objective function to be minimized.
     x0 : ndarray
-        Initial guess.
+        Initial guess, shape (n,)
     fprime : callable ``f'(x,*args)``, optional
         Gradient of f.
     args : tuple, optional
@@ -1287,6 +1240,13 @@ def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
         Relative tolerance for `x`. Terminate successfully if step
         size is less than ``xk * xrtol`` where ``xk`` is the current
         parameter vector.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.9
+        Parameter for curvature condition rule.
+    hess_inv0 : None or ndarray, optional``
+        Initial inverse hessian estimate, shape (n, n). If None (default) then
+        the identity matrix is used.
 
     Returns
     -------
@@ -1315,6 +1275,8 @@ def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
     Optimize the function, `f`, whose gradient is given by `fprime`
     using the quasi-Newton method of Broyden, Fletcher, Goldfarb,
     and Shanno (BFGS).
+
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
 
     See Also
     --------
@@ -1360,7 +1322,11 @@ def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
             'eps': epsilon,
             'disp': disp,
             'maxiter': maxiter,
-            'return_all': retall}
+            'return_all': retall,
+            'xrtol': xrtol,
+            'c1': c1,
+            'c2': c2,
+            'hess_inv0': hess_inv0}
 
     callback = _wrap_callback(callback)
     res = _minimize_bfgs(f, x0, args, fprime, callback=callback, **opts)
@@ -1381,7 +1347,8 @@ def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
 def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
                    gtol=1e-5, norm=np.inf, eps=_epsilon, maxiter=None,
                    disp=False, return_all=False, finite_diff_rel_step=None,
-                   xrtol=0, **unknown_options):
+                   xrtol=0, c1=1e-4, c2=0.9,
+                   hess_inv0=None, **unknown_options):
     """
     Minimization of scalar function of one or more variables using the
     BFGS algorithm.
@@ -1403,7 +1370,7 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
         Set to True to return a list of the best solution at each of the
         iterations.
     finite_diff_rel_step : None or array_like, optional
-        If `jac in ['2-point', '3-point', 'cs']` the relative step size to
+        If ``jac in ['2-point', '3-point', 'cs']`` the relative step size to
         use for numerical approximation of the jacobian. The absolute step
         size is computed as ``h = rel_step * sign(x) * max(1, abs(x))``,
         possibly adjusted to fit into the bounds. For ``jac='3-point'``
@@ -1412,8 +1379,28 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
     xrtol : float, default: 0
         Relative tolerance for `x`. Terminate successfully if step size is
         less than ``xk * xrtol`` where ``xk`` is the current parameter vector.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.9
+        Parameter for curvature condition rule.
+    hess_inv0 : None or ndarray, optional
+        Initial inverse hessian estimate, shape (n, n). If None (default) then
+        the identity matrix is used.
+
+    Notes
+    -----
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
+
+    If minimization doesn't complete successfully, with an error message of
+    ``Desired error not necessarily achieved due to precision loss``, then
+    consider setting `gtol` to a higher value. This precision loss typically
+    occurs when the (finite difference) numerical differentiation cannot provide
+    sufficient precision to satisfy the `gtol` termination criterion.
+    This can happen when working in single precision and a callable jac is not
+    provided. For single precision problems a `gtol` of 1e-3 seems to work.
     """
     _check_unknown_options(unknown_options)
+    _check_positive_definite(hess_inv0)
     retall = return_all
 
     x0 = asarray(x0).flatten()
@@ -1434,7 +1421,7 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
     k = 0
     N = len(x0)
     I = np.eye(N, dtype=int)
-    Hk = I
+    Hk = I if hess_inv0 is None else hess_inv0
 
     # Sets the initial step guess to dx ~ 1
     old_old_fval = old_fval + np.linalg.norm(gfk) / 2
@@ -1449,7 +1436,8 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
         try:
             alpha_k, fc, gc, old_fval, old_old_fval, gfkp1 = \
                      _line_search_wolfe12(f, myfprime, xk, pk, gfk,
-                                          old_fval, old_old_fval, amin=1e-100, amax=1e100)
+                                          old_fval, old_old_fval, amin=1e-100,
+                                          amax=1e100, c1=c1, c2=c2)
         except _LineSearchError:
             # Line search failed to find a better solution.
             warnflag = 2
@@ -1488,7 +1476,7 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
             break
 
         rhok_inv = np.dot(yk, sk)
-        # this was handled in numeric, let it remaines for more safety
+        # this was handled in numeric, let it remains for more safety
         # Cryptic comment above is preserved for posterity. Future reader:
         # consider change to condition below proposed in gh-1261/gh-17345.
         if rhok_inv == 0.:
@@ -1519,10 +1507,10 @@ def _minimize_bfgs(fun, x0, args=(), jac=None, callback=None,
 
     if disp:
         _print_success_message_or_warn(warnflag, msg)
-        print("         Current function value: %f" % fval)
-        print("         Iterations: %d" % k)
-        print("         Function evaluations: %d" % sf.nfev)
-        print("         Gradient evaluations: %d" % sf.ngev)
+        print(f"         Current function value: {fval:f}")
+        print(f"         Iterations: {k:d}")
+        print(f"         Function evaluations: {sf.nfev:d}")
+        print(f"         Gradient evaluations: {sf.ngev:d}")
 
     result = OptimizeResult(fun=fval, jac=gfk, hess_inv=Hk, nfev=sf.nfev,
                             njev=sf.ngev, status=warnflag,
@@ -1542,7 +1530,7 @@ def _print_success_message_or_warn(warnflag, message, warntype=None):
 
 def fmin_cg(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
             epsilon=_epsilon, maxiter=None, full_output=0, disp=1, retall=0,
-            callback=None):
+            callback=None, c1=1e-4, c2=0.4):
     """
     Minimize a function using a nonlinear conjugate gradient algorithm.
 
@@ -1587,6 +1575,10 @@ def fmin_cg(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
     callback : callable, optional
         An optional user-supplied function, called after each iteration.
         Called as ``callback(xk)``, where ``xk`` is the current value of `x0`.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.4
+        Parameter for curvature condition rule.
 
     Returns
     -------
@@ -1639,6 +1631,8 @@ def fmin_cg(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
     4. `fprime` is not too large, e.g., has a norm less than 1000,
     5. The initial guess, `x0`, is reasonably close to `f` 's global
        minimizing point, `xopt`.
+
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
 
     References
     ----------
@@ -1702,7 +1696,8 @@ def fmin_cg(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
             'return_all': retall}
 
     callback = _wrap_callback(callback)
-    res = _minimize_cg(f, x0, args, fprime, callback=callback, **opts)
+    res = _minimize_cg(f, x0, args, fprime, callback=callback, c1=c1, c2=c2,
+                       **opts)
 
     if full_output:
         retlist = res['x'], res['fun'], res['nfev'], res['njev'], res['status']
@@ -1719,7 +1714,7 @@ def fmin_cg(f, x0, fprime=None, args=(), gtol=1e-5, norm=np.inf,
 def _minimize_cg(fun, x0, args=(), jac=None, callback=None,
                  gtol=1e-5, norm=np.inf, eps=_epsilon, maxiter=None,
                  disp=False, return_all=False, finite_diff_rel_step=None,
-                 **unknown_options):
+                 c1=1e-4, c2=0.4, **unknown_options):
     """
     Minimization of scalar function of one or more variables using the
     conjugate gradient algorithm.
@@ -1742,12 +1737,20 @@ def _minimize_cg(fun, x0, args=(), jac=None, callback=None,
         Set to True to return a list of the best solution at each of the
         iterations.
     finite_diff_rel_step : None or array_like, optional
-        If `jac in ['2-point', '3-point', 'cs']` the relative step size to
+        If ``jac in ['2-point', '3-point', 'cs']`` the relative step size to
         use for numerical approximation of the jacobian. The absolute step
         size is computed as ``h = rel_step * sign(x) * max(1, abs(x))``,
         possibly adjusted to fit into the bounds. For ``jac='3-point'``
         the sign of `h` is ignored. If None (default) then step is selected
         automatically.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.4
+        Parameter for curvature condition rule.
+
+    Notes
+    -----
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
     """
     _check_unknown_options(unknown_options)
 
@@ -1814,8 +1817,8 @@ def _minimize_cg(fun, x0, args=(), jac=None, callback=None,
         try:
             alpha_k, fc, gc, old_fval, old_old_fval, gfkp1 = \
                      _line_search_wolfe12(f, myfprime, xk, pk, gfk, old_fval,
-                                          old_old_fval, c2=0.4, amin=1e-100, amax=1e100,
-                                          extra_condition=descent_condition)
+                                          old_old_fval, c1=c1, c2=c2, amin=1e-100,
+                                          amax=1e100, extra_condition=descent_condition)
         except _LineSearchError:
             # Line search failed to find a better solution.
             warnflag = 2
@@ -1848,10 +1851,10 @@ def _minimize_cg(fun, x0, args=(), jac=None, callback=None,
 
     if disp:
         _print_success_message_or_warn(warnflag, msg)
-        print("         Current function value: %f" % fval)
-        print("         Iterations: %d" % k)
-        print("         Function evaluations: %d" % sf.nfev)
-        print("         Gradient evaluations: %d" % sf.ngev)
+        print(f"         Current function value: {fval:f}")
+        print(f"         Iterations: {k:d}")
+        print(f"         Function evaluations: {sf.nfev:d}")
+        print(f"         Gradient evaluations: {sf.ngev:d}")
 
     result = OptimizeResult(fun=fval, jac=gfk, nfev=sf.nfev,
                             njev=sf.ngev, status=warnflag,
@@ -1864,7 +1867,7 @@ def _minimize_cg(fun, x0, args=(), jac=None, callback=None,
 
 def fmin_ncg(f, x0, fprime, fhess_p=None, fhess=None, args=(), avextol=1e-5,
              epsilon=_epsilon, maxiter=None, full_output=0, disp=1, retall=0,
-             callback=None):
+             callback=None, c1=1e-4, c2=0.9):
     """
     Unconstrained minimization of a function using the Newton-CG method.
 
@@ -1902,6 +1905,10 @@ def fmin_ncg(f, x0, fprime, fhess_p=None, fhess=None, args=(), avextol=1e-5,
         If True, print convergence message.
     retall : bool, optional
         If True, return a list of results at each iteration.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.9
+        Parameter for curvature condition rule
 
     Returns
     -------
@@ -1948,6 +1955,8 @@ def fmin_ncg(f, x0, fprime, fhess_p=None, fhess=None, args=(), avextol=1e-5,
         or box constrained minimization. (Box constraints give
         lower and upper bounds for each variable separately.)
 
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
+
     References
     ----------
     Wright & Nocedal, 'Numerical Optimization', 1999, p. 140.
@@ -1961,7 +1970,7 @@ def fmin_ncg(f, x0, fprime, fhess_p=None, fhess=None, args=(), avextol=1e-5,
 
     callback = _wrap_callback(callback)
     res = _minimize_newtoncg(f, x0, args, fprime, fhess, fhess_p,
-                             callback=callback, **opts)
+                             callback=callback, c1=c1, c2=c2, **opts)
 
     if full_output:
         retlist = (res['x'], res['fun'], res['nfev'], res['njev'],
@@ -1978,7 +1987,7 @@ def fmin_ncg(f, x0, fprime, fhess_p=None, fhess=None, args=(), avextol=1e-5,
 
 def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
                        callback=None, xtol=1e-5, eps=_epsilon, maxiter=None,
-                       disp=False, return_all=False,
+                       disp=False, return_all=False, c1=1e-4, c2=0.9,
                        **unknown_options):
     """
     Minimization of scalar function of one or more variables using the
@@ -2000,6 +2009,14 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
     return_all : bool, optional
         Set to True to return a list of the best solution at each of the
         iterations.
+    c1 : float, default: 1e-4
+        Parameter for Armijo condition rule.
+    c2 : float, default: 0.9
+        Parameter for curvature condition rule.
+
+    Notes
+    -----
+    Parameters `c1` and `c2` must satisfy ``0 < c1 < c2 < 1``.
     """
     _check_unknown_options(unknown_options)
     if jac is None:
@@ -2021,7 +2038,7 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
 
     # Logic for hess/hessp
     # - If a callable(hess) is provided, then use that
-    # - If hess is a FD_METHOD, or the output fom hess(x) is a LinearOperator
+    # - If hess is a FD_METHOD, or the output from hess(x) is a LinearOperator
     #   then create a hessp function using those.
     # - If hess is None but you have callable(hessp) then use the hessp.
     # - If hess and hessp are None then approximate hessp using the grad/jac.
@@ -2037,11 +2054,11 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
     def terminate(warnflag, msg):
         if disp:
             _print_success_message_or_warn(warnflag, msg)
-            print("         Current function value: %f" % old_fval)
-            print("         Iterations: %d" % k)
-            print("         Function evaluations: %d" % sf.nfev)
-            print("         Gradient evaluations: %d" % sf.ngev)
-            print("         Hessian evaluations: %d" % hcalls)
+            print(f"         Current function value: {old_fval:f}")
+            print(f"         Iterations: {k:d}")
+            print(f"         Function evaluations: {sf.nfev:d}")
+            print(f"         Gradient evaluations: {sf.ngev:d}")
+            print(f"         Hessian evaluations: {hcalls:d}")
         fval = old_fval
         result = OptimizeResult(fun=fval, jac=gfk, nfev=sf.nfev,
                                 njev=sf.ngev, nhev=hcalls, status=warnflag,
@@ -2057,8 +2074,9 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
     cg_maxiter = 20*len(x0)
 
     xtol = len(x0) * avextol
-    update = [2 * xtol]
-    xk = x0
+    # Make sure we enter the while loop.
+    update_l1norm = np.finfo(float).max
+    xk = np.copy(x0)
     if retall:
         allvecs = [xk]
     k = 0
@@ -2066,15 +2084,15 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
     old_fval = f(x0)
     old_old_fval = None
     float64eps = np.finfo(np.float64).eps
-    while np.add.reduce(np.abs(update)) > xtol:
+    while update_l1norm > xtol:
         if k >= maxiter:
             msg = "Warning: " + _status_message['maxiter']
             return terminate(1, msg)
         # Compute a search direction pk by applying the CG method to
         #  del2 f(xk) p = - grad f(xk) starting from 0.
         b = -fprime(xk)
-        maggrad = np.add.reduce(np.abs(b))
-        eta = np.min([0.5, np.sqrt(maggrad)])
+        maggrad = np.linalg.norm(b, ord=1)
+        eta = min(0.5, math.sqrt(maggrad))
         termcond = eta * maggrad
         xsupi = zeros(len(x0), dtype=x0.dtype)
         ri = -b
@@ -2084,7 +2102,7 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
 
         if fhess is not None:             # you want to compute hessian once.
             A = sf.hess(xk)
-            hcalls = hcalls + 1
+            hcalls += 1
 
         for k2 in range(cg_maxiter):
             if np.add.reduce(np.abs(ri)) <= termcond:
@@ -2094,13 +2112,11 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
                     Ap = approx_fhess_p(xk, psupi, fprime, epsilon)
                 else:
                     Ap = fhess_p(xk, psupi, *args)
-                    hcalls = hcalls + 1
+                    hcalls += 1
             else:
-                if isinstance(A, HessianUpdateStrategy):
-                    # if hess was supplied as a HessianUpdateStrategy
-                    Ap = A.dot(psupi)
-                else:
-                    Ap = np.dot(A, psupi)
+                # hess was supplied as a callable or hessian update strategy, so
+                # A is a dense numpy array or sparse array
+                Ap = A.dot(psupi)
             # check curvature
             Ap = asarray(Ap).squeeze()  # get rid of matrices...
             curv = np.dot(psupi, Ap)
@@ -2114,12 +2130,12 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
                     xsupi = dri0 / (-curv) * b
                     break
             alphai = dri0 / curv
-            xsupi = xsupi + alphai * psupi
-            ri = ri + alphai * Ap
+            xsupi += alphai * psupi
+            ri += alphai * Ap
             dri1 = np.dot(ri, ri)
             betai = dri1 / dri0
             psupi = -ri + betai * psupi
-            i = i + 1
+            i += 1
             dri0 = dri1          # update np.dot(ri,ri) for next time.
         else:
             # curvature keeps increasing, bail out
@@ -2133,23 +2149,24 @@ def _minimize_newtoncg(fun, x0, args=(), jac=None, hess=None, hessp=None,
         try:
             alphak, fc, gc, old_fval, old_old_fval, gfkp1 = \
                      _line_search_wolfe12(f, fprime, xk, pk, gfk,
-                                          old_fval, old_old_fval)
+                                          old_fval, old_old_fval, c1=c1, c2=c2)
         except _LineSearchError:
             # Line search failed to find a better solution.
             msg = "Warning: " + _status_message['pr_loss']
             return terminate(2, msg)
 
         update = alphak * pk
-        xk = xk + update        # upcast if necessary
+        xk += update        # upcast if necessary
         if retall:
             allvecs.append(xk)
         k += 1
         intermediate_result = OptimizeResult(x=xk, fun=old_fval)
         if _call_callback_maybe_halt(callback, intermediate_result):
             return terminate(5, "")
+        update_l1norm = np.linalg.norm(update, ord=1)
 
     else:
-        if np.isnan(old_fval) or np.isnan(update).any():
+        if np.isnan(old_fval) or np.isnan(update_l1norm):
             return terminate(3, _status_message['nan'])
 
         msg = _status_message['success']
@@ -2174,13 +2191,16 @@ def fminbound(func, x1, x2, args=(), xtol=1e-5, maxfun=500,
         Maximum number of function evaluations allowed.
     full_output : bool, optional
         If True, return optional outputs.
-    disp : int, optional
+    disp: int, optional
         If non-zero, print messages.
-            0 : no message printing.
-            1 : non-convergence notification messages only.
-            2 : print a message on convergence too.
-            3 : print iteration results.
 
+        ``0`` : no message printing.
+
+        ``1`` : non-convergence notification messages only.
+
+        ``2`` : print a message on convergence too.
+
+        ``3`` : print iteration results.
 
     Returns
     -------
@@ -2257,10 +2277,15 @@ def _minimize_scalar_bounded(func, bounds, args=(),
         Maximum number of iterations to perform.
     disp: int, optional
         If non-zero, print messages.
-            0 : no message printing.
-            1 : non-convergence notification messages only.
-            2 : print a message on convergence too.
-            3 : print iteration results.
+
+        ``0`` : no message printing.
+
+        ``1`` : non-convergence notification messages only.
+
+        ``2`` : print a message on convergence too.
+
+        ``3`` : print iteration results.
+
     xatol : float
         Absolute error in solution `xopt` acceptable for convergence.
 
@@ -2663,12 +2688,17 @@ def _minimize_scalar_brent(func, brack=None, args=(), xtol=1.48e-8,
         Maximum number of iterations to perform.
     xtol : float
         Relative error in solution `xopt` acceptable for convergence.
-    disp: int, optional
+    disp : int, optional
         If non-zero, print messages.
-            0 : no message printing.
-            1 : non-convergence notification messages only.
-            2 : print a message on convergence too.
-            3 : print iteration results.
+
+        ``0`` : no message printing.
+
+        ``1`` : non-convergence notification messages only.
+
+        ``2`` : print a message on convergence too.
+
+        ``3`` : print iteration results.
+
     Notes
     -----
     Uses inverse parabolic interpolation when possible to speed up
@@ -2678,7 +2708,7 @@ def _minimize_scalar_brent(func, brack=None, args=(), xtol=1.48e-8,
     _check_unknown_options(unknown_options)
     tol = xtol
     if tol < 0:
-        raise ValueError('tolerance should be >= 0, got %r' % tol)
+        raise ValueError(f'tolerance should be >= 0, got {tol!r}')
 
     brent = Brent(func=func, args=args, tol=tol,
                   full_output=True, maxiter=maxiter, disp=disp)
@@ -2794,10 +2824,14 @@ def _minimize_scalar_golden(func, brack=None, args=(),
         Maximum number of iterations to perform.
     disp: int, optional
         If non-zero, print messages.
-            0 : no message printing.
-            1 : non-convergence notification messages only.
-            2 : print a message on convergence too.
-            3 : print iteration results.
+
+        ``0`` : no message printing.
+
+        ``1`` : non-convergence notification messages only.
+
+        ``2`` : print a message on convergence too.
+
+        ``3`` : print iteration results.
     """
     _check_unknown_options(unknown_options)
     tol = xtol
@@ -2940,7 +2974,7 @@ def bracket(func, xa=0.0, xb=1.0, args=(), grow_limit=110.0, maxiter=1000):
     The algorithm attempts to find three strictly ordered points (i.e.
     :math:`x_a < x_b < x_c` or :math:`x_c < x_b < x_a`) satisfying
     :math:`f(x_b) ≤ f(x_a)` and :math:`f(x_b) ≤ f(x_c)`, where one of the
-    inequalities must be satistfied strictly and all :math:`x_i` must be
+    inequalities must be satisfied strictly and all :math:`x_i` must be
     finite.
 
     Examples
@@ -3162,7 +3196,7 @@ def _linesearch_powell(func, p, xi, tol=1e-3,
                        lower_bound=None, upper_bound=None, fval=None):
     """Line-search algorithm using fminbound.
 
-    Find the minimium of the function ``func(x0 + alpha*direc)``.
+    Find the minimum of the function ``func(x0 + alpha*direc)``.
 
     lower_bound : np.array.
         The lower bounds for each parameter in ``x0``. If the ``i``th
@@ -3191,7 +3225,7 @@ def _linesearch_powell(func, p, xi, tol=1e-3,
                                           myfunc, None, tuple(), xtol=tol)
         alpha_min, fret = res.x, res.fun
         xi = alpha_min * xi
-        return squeeze(fret), p + xi, xi
+        return fret, p + xi, xi
     else:
         bound = _line_for_search(p, xi, lower_bound, upper_bound)
         if np.isneginf(bound[0]) and np.isposinf(bound[1]):
@@ -3201,7 +3235,7 @@ def _linesearch_powell(func, p, xi, tol=1e-3,
             # we can use a bounded scalar minimization
             res = _minimize_scalar_bounded(myfunc, bound, xatol=tol / 100)
             xi = res.x * xi
-            return squeeze(res.fun), p + xi, xi
+            return res.fun, p + xi, xi
         else:
             # only bounded on one side. use the tangent function to convert
             # the infinity bound to a finite bound. The new bounded region
@@ -3212,7 +3246,7 @@ def _linesearch_powell(func, p, xi, tol=1e-3,
                 bound,
                 xatol=tol / 100)
             xi = np.tan(res.x) * xi
-            return squeeze(res.fun), p + xi, xi
+            return res.fun, p + xi, xi
 
 
 def fmin_powell(func, x0, args=(), xtol=1e-4, ftol=1e-4, maxiter=None,
@@ -3368,9 +3402,9 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
     Parameters
     ----------
     fun : callable
-        The objective function to be minimized.
+        The objective function to be minimized::
 
-            ``fun(x, *args) -> float``
+            fun(x, *args) -> float
 
         where ``x`` is a 1-D array with shape (n,) and ``args``
         is a tuple of the fixed parameters needed to completely
@@ -3387,9 +3421,9 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
     bounds : sequence or `Bounds`, optional
         Bounds on decision variables. There are two ways to specify the bounds:
 
-            1. Instance of `Bounds` class.
-            2. Sequence of ``(min, max)`` pairs for each element in `x`. None
-               is used to specify no bound.
+        1. Instance of `Bounds` class.
+        2. Sequence of ``(min, max)`` pairs for each element in `x`. None
+           is used to specify no bound.
 
         If bounds are not provided, then an unbounded line search will be used.
         If bounds are provided and the initial guess is within the bounds, then
@@ -3406,17 +3440,17 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
         A dictionary of solver options. All methods accept the following
         generic options:
 
-            maxiter : int
-                Maximum number of iterations to perform. Depending on the
-                method each iteration may use several function evaluations.
-            disp : bool
-                Set to True to print convergence messages.
+        maxiter : int
+            Maximum number of iterations to perform. Depending on the
+            method each iteration may use several function evaluations.
+        disp : bool
+            Set to True to print convergence messages.
 
         See method-specific options for ``method='powell'`` below.
     callback : callable, optional
-        Called after each iteration. The signature is:
+        Called after each iteration. The signature is::
 
-            ``callback(xk)``
+            callback(xk)
 
         where ``xk`` is the current parameter vector.
 
@@ -3485,7 +3519,7 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
         if np.linalg.matrix_rank(direc) != direc.shape[0]:
             warnings.warn("direc input is not full rank, some parameters may "
                           "not be optimized",
-                          OptimizeWarning, 3)
+                          OptimizeWarning, stacklevel=3)
 
     if bounds is None:
         # don't make these arrays of all +/- inf. because
@@ -3498,9 +3532,9 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
         lower_bound, upper_bound = bounds.lb, bounds.ub
         if np.any(lower_bound > x0) or np.any(x0 > upper_bound):
             warnings.warn("Initial guess is not within the specified bounds",
-                          OptimizeWarning, 3)
+                          OptimizeWarning, stacklevel=3)
 
-    fval = squeeze(func(x))
+    fval = func(x)
     x1 = x.copy()
     iter = 0
     while True:
@@ -3545,7 +3579,7 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
             else:
                 _, lmax = _line_for_search(x, direc1, lower_bound, upper_bound)
             x2 = x + min(lmax, 1) * direc1
-            fx2 = squeeze(func(x2))
+            fx2 = func(x2)
 
             if (fx > fx2):
                 t = 2.0*(fx + fx2 - 2.0*fval)
@@ -3588,10 +3622,9 @@ def _minimize_powell(func, x0, args=(), callback=None, bounds=None,
 
     if disp:
         _print_success_message_or_warn(warnflag, msg, RuntimeWarning)
-        print("         Current function value: %f" % fval)
-        print("         Iterations: %d" % iter)
-        print("         Function evaluations: %d" % fcalls[0])
-
+        print(f"         Current function value: {fval:f}")
+        print(f"         Iterations: {iter:d}")
+        print(f"         Function evaluations: {fcalls[0]:d}")
     result = OptimizeResult(fun=fval, direc=direc, nit=iter, nfev=fcalls[0],
                             status=warnflag, success=(warnflag == 0),
                             message=msg, x=x)
@@ -3612,7 +3645,7 @@ def _endprint(x, flag, fval, maxfun, xtol, disp):
         msg = ("\nMaximum number of function evaluations exceeded --- "
                "increase maxfun argument.\n")
     elif flag == 2:
-        msg = "\n{}".format(_status_message['nan'])
+        msg = f"\n{_status_message['nan']}"
 
     _print_success_message_or_warn(flag, msg)
     return
@@ -3733,7 +3766,7 @@ def brute(func, ranges, args=(), Ns=20, full_output=0, finish=fmin,
     the `finish` program's results usually will not coincide with any
     gridpoint, and may fall outside the grid's boundary. Thus, if a
     minimum only needs to be found over the provided grid points, make
-    sure to pass in `finish=None`.
+    sure to pass in ``finish=None``.
 
     *Note 2*: The grid of points is a `numpy.mgrid` object.
     For `brute` the `ranges` and `Ns` inputs have the following effect.
@@ -3869,10 +3902,9 @@ def brute(func, ranges, args=(), Ns=20, full_output=0, finish=fmin,
             success = res[-1] == 0
         if not success:
             if disp:
-                warnings.warn(
-                    "Either final optimization did not succeed "
-                    "or `finish` does not return `statuscode` as its last "
-                    "argument.", RuntimeWarning, 2)
+                warnings.warn("Either final optimization did not succeed or `finish` "
+                              "does not return `statuscode` as its last argument.",
+                              RuntimeWarning, stacklevel=2)
 
     if full_output:
         return xmin, Jmin, grid, Jout
@@ -3933,6 +3965,7 @@ def show_options(solver=None, method=None, disp=True):
     - :ref:`L-BFGS-B    <optimize.minimize-lbfgsb>`
     - :ref:`TNC         <optimize.minimize-tnc>`
     - :ref:`COBYLA      <optimize.minimize-cobyla>`
+    - :ref:`COBYQA      <optimize.minimize-cobyqa>`
     - :ref:`SLSQP       <optimize.minimize-slsqp>`
     - :ref:`dogleg      <optimize.minimize-dogleg>`
     - :ref:`trust-ncg   <optimize.minimize-trustncg>`
@@ -4007,6 +4040,7 @@ def show_options(solver=None, method=None, disp=True):
             ('bfgs', 'scipy.optimize._optimize._minimize_bfgs'),
             ('cg', 'scipy.optimize._optimize._minimize_cg'),
             ('cobyla', 'scipy.optimize._cobyla_py._minimize_cobyla'),
+            ('cobyqa', 'scipy.optimize._cobyqa_py._minimize_cobyqa'),
             ('dogleg', 'scipy.optimize._trustregion_dogleg._minimize_dogleg'),
             ('l-bfgs-b', 'scipy.optimize._lbfgsb_py._minimize_lbfgsb'),
             ('nelder-mead', 'scipy.optimize._optimize._minimize_neldermead'),

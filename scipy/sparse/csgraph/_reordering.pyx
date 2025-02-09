@@ -5,7 +5,8 @@
 import numpy as np
 cimport numpy as np
 from warnings import warn
-from scipy.sparse import csr_matrix, issparse, SparseEfficiencyWarning
+from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
+from scipy.sparse._sputils import convert_pydata_sparse_to_scipy
 from . import maximum_bipartite_matching
 
 np.import_array()
@@ -26,8 +27,8 @@ def reverse_cuthill_mckee(graph, symmetric_mode=False):
     
     Parameters
     ----------
-    graph : sparse matrix
-        Input sparse in CSC or CSR sparse matrix format.
+    graph : sparse array or matrix
+        Input sparse in CSC or CSR sparse array or matrix format.
     symmetric_mode : bool, optional
         Is input matrix guaranteed to be symmetric.
 
@@ -47,7 +48,7 @@ def reverse_cuthill_mckee(graph, symmetric_mode=False):
 
     Examples
     --------
-    >>> from scipy.sparse import csr_matrix
+    >>> from scipy.sparse import csr_array
     >>> from scipy.sparse.csgraph import reverse_cuthill_mckee
 
     >>> graph = [
@@ -56,22 +57,26 @@ def reverse_cuthill_mckee(graph, symmetric_mode=False):
     ... [2, 0, 0, 3],
     ... [0, 0, 0, 0]
     ... ]
-    >>> graph = csr_matrix(graph)
+    >>> graph = csr_array(graph)
     >>> print(graph)
-      (0, 1)	1
-      (0, 2)	2
-      (1, 3)	1
-      (2, 0)	2
-      (2, 3)	3
+    <Compressed Sparse Row sparse array of dtype 'int64'
+        with 5 stored elements and shape (4, 4)>
+        Coords	Values
+        (0, 1)	1
+        (0, 2)	2
+        (1, 3)	1
+        (2, 0)	2
+        (2, 3)	3
 
     >>> reverse_cuthill_mckee(graph)
     array([3, 2, 1, 0], dtype=int32)
     
     """
+    graph = convert_pydata_sparse_to_scipy(graph)
     if not issparse(graph):
         raise TypeError("Input graph must be sparse")
     if graph.format not in ("csc", "csr"):
-        raise TypeError('Input must be in CSC or CSR sparse matrix format.')
+        raise TypeError('Input must be in CSC or CSR sparse format.')
     nrows = graph.shape[0]
     if not symmetric_mode:
         graph = graph+graph.transpose()
@@ -185,8 +190,8 @@ def structural_rank(graph):
 
     Parameters
     ----------
-    graph : sparse matrix
-        Input sparse matrix.
+    graph : sparse array or matrix
+        Input sparse array.
 
     Returns
     -------
@@ -202,7 +207,7 @@ def structural_rank(graph):
 
     Examples
     --------
-    >>> from scipy.sparse import csr_matrix
+    >>> from scipy.sparse import csr_array
     >>> from scipy.sparse.csgraph import structural_rank
 
     >>> graph = [
@@ -211,28 +216,32 @@ def structural_rank(graph):
     ... [2, 0, 0, 3],
     ... [0, 1, 3, 0]
     ... ]
-    >>> graph = csr_matrix(graph)
+    >>> graph = csr_array(graph)
     >>> print(graph)
-      (0, 1)	1
-      (0, 2)	2
-      (1, 0)	1
-      (1, 3)	1
-      (2, 0)	2
-      (2, 3)	3
-      (3, 1)	1
-      (3, 2)	3
+    <Compressed Sparse Row sparse array of dtype 'int64'
+        with 8 stored elements and shape (4, 4)>
+        Coords	Values
+        (0, 1)	1
+        (0, 2)	2
+        (1, 0)	1
+        (1, 3)	1
+        (2, 0)	2
+        (2, 3)	3
+        (3, 1)	1
+        (3, 2)	3
 
     >>> structural_rank(graph)
     4
 
     """
-    if not issparse:
-        raise TypeError('Input must be a sparse matrix')
+    graph = convert_pydata_sparse_to_scipy(graph)
+    if not issparse(graph):
+        raise TypeError('Input must be sparse')
     if graph.format != "csr":
         if graph.format not in ("csc", "coo"):
             warn('Input matrix should be in CSC, CSR, or COO matrix format',
                     SparseEfficiencyWarning)
-        graph = csr_matrix(graph)
+        graph = csr_array(graph)
     # If A is a tall matrix, then transpose.
     if graph.shape[0] > graph.shape[1]:
         graph = graph.T.tocsr()
